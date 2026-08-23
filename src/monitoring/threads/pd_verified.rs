@@ -24,7 +24,10 @@ use crate::platform::EventFd;
 const NATIVE_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(4);
 const RECONNECT_STEP_DELAY: Duration = Duration::from_secs(1);
 const DETACH_DEBOUNCE: Duration = Duration::from_millis(1500);
-const MAX_PUBLIC_RETRIES_PER_ATTACHMENT: u8 = 2;
+// A USB meter/adapter can keep Type-C attached while its upstream charger is
+// swapped. The retry budget therefore belongs to the current upstream charger
+// session, not to the physical Type-C attachment.
+const MAX_PUBLIC_RETRIES_PER_UPSTREAM_SESSION: u8 = 2;
 
 #[derive(Clone, Copy, Debug)]
 enum AutoPhase {
@@ -83,7 +86,7 @@ fn should_rearm_public_retry(
 
 #[cfg(any(unix, test))]
 fn can_start_public_retry(attempt_count: u8) -> bool {
-    attempt_count < MAX_PUBLIC_RETRIES_PER_ATTACHMENT
+    attempt_count < MAX_PUBLIC_RETRIES_PER_UPSTREAM_SESSION
 }
 
 pub fn spawn_pd_verified_monitor(
@@ -511,17 +514,17 @@ fn run_unix(
                 let deadline =
                     charger_detach_deadline.get_or_insert_with(|| Instant::now() + DETACH_DEBOUNCE);
                 if Instant::now() >= *deadline {
-                    if can_start_public_retry(public_retry_count) {
-                        public_retry_attempted = false;
-                        charger_detach_armed = false;
-                        usb_detach_uevent_seen = false;
-                        charger_detach_deadline = None;
-                        info!("[自动] 检测到充电器已从转接设备断开，允许下一次公版PPS重连");
-                    } else {
-                        charger_detach_deadline = None;
-                        usb_detach_uevent_seen = false;
-                        debug!("[自动] 公版PPS重试次数已达上限，等待物理拔出后重置");
-                    }
+                    // A stable offline interval is evidence that the upstream
+                    // charger changed, so start a fresh bounded retry session.
+                    // Resetting here is what lets a later charger in the same
+                    // Type-C attachment (for example 1 -> 3 -> 2 -> 3) get a
+                    // retry even after the previous charger used its budget.
+                    public_retry_count = 0;
+                    public_retry_attempted = false;
+                    charger_detach_armed = false;
+                    usb_detach_uevent_seen = false;
+                    charger_detach_deadline = None;
+                    info!("[自动] 检测到充电器已从转接设备断开，重置公版PPS重试预算");
                 }
             } else {
                 charger_detach_deadline = None;
