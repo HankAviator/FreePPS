@@ -89,6 +89,15 @@ fn can_start_public_retry(attempt_count: u8) -> bool {
     attempt_count < MAX_PUBLIC_RETRIES_PER_UPSTREAM_SESSION
 }
 
+#[cfg(any(unix, test))]
+fn should_start_native_wait_after_upstream_attach(
+    upstream_native_pending: bool,
+    battery_status: &str,
+    usb_online: &str,
+) -> bool {
+    upstream_native_pending && battery_status == "Charging" && usb_online == "1"
+}
+
 pub fn spawn_pd_verified_monitor(
     running: Arc<AtomicBool>,
     pd_verifier: Arc<PdVerifier>,
@@ -232,12 +241,15 @@ fn run_unix(
         }
         _ => AutoPhase::Idle,
     };
-    // Bound retries per physical Type-C attachment. A second attempt is
-    // available for a real upstream charger swap or a failed first
-    // negotiation, but transient USB/PD events cannot create an unbounded
-    // reconnect loop.
+    // Bound retries per upstream charger session. A second attempt is
+    // available for a real charger swap or a failed first negotiation, but
+    // transient USB/PD events cannot create an unbounded reconnect loop.
     let mut public_retry_count = 0;
     let mut public_retry_attempted = false;
+    // An upstream swap must re-enter the Xiaomi-first negotiation window
+    // before public PPS fallback is allowed. This is separate from
+    // `public_retry_attempted`, which reserves the current session budget.
+    let mut upstream_native_pending = false;
     let mut uevent_recheck_deadline = None;
     let mut charger_detach_armed = false;
     let mut usb_detach_uevent_seen = false;
@@ -336,6 +348,7 @@ fn run_unix(
             detach_deadline = None;
             public_retry_count = 0;
             public_retry_attempted = false;
+            upstream_native_pending = false;
             charger_detach_armed = false;
             usb_detach_uevent_seen = false;
             charger_detach_deadline = None;
@@ -432,6 +445,7 @@ fn run_unix(
                 }
                 public_retry_count = 0;
                 public_retry_attempted = false;
+                upstream_native_pending = false;
                 charger_detach_armed = false;
                 usb_detach_uevent_seen = false;
                 charger_detach_deadline = None;
@@ -450,6 +464,7 @@ fn run_unix(
                 attached = true;
                 public_retry_count = 0;
                 public_retry_attempted = false;
+                upstream_native_pending = false;
                 charger_detach_armed = false;
                 usb_detach_uevent_seen = false;
                 charger_detach_deadline = None;
@@ -471,6 +486,7 @@ fn run_unix(
         }
 
         if mode != ChargingMode::Automatic || !attached {
+            upstream_native_pending = false;
             charger_detach_armed = false;
             usb_detach_uevent_seen = false;
             charger_detach_deadline = None;
@@ -494,15 +510,27 @@ fn run_unix(
                 && usb_online == "1"
                 && verified != "1"
                 && usb_type == "PD_PPS"
+                && !upstream_native_pending
                 && can_start_public_retry(public_retry_count);
 
-            if battery_status == "Charging" && usb_online == "1" {
-                if !charger_detach_armed {
-                    debug!("[自动] 公版PPS重连后确认仍在充电，启用上游断开检测");
-                }
-                charger_detach_armed = true;
+            if should_start_native_wait_after_upstream_attach(
+                upstream_native_pending,
+                &battery_status,
+                &usb_online,
+            ) {
+                upstream_native_pending = false;
+                charger_detach_armed = false;
                 charger_detach_deadline = None;
                 usb_detach_uevent_seen = false;
+                phase = AutoPhase::WaitingNative(Instant::now() + NATIVE_NEGOTIATION_TIMEOUT);
+                info!("[自动] 检测到新充电器，重新等待小米协议认证");
+            } else if battery_status == "Charging" && usb_online == "1" {
+                if !charger_detach_armed {
+                    debug!("[自动] 公版PPS重连后确认仍在充电，启用上游断开检测");
+                    charger_detach_armed = true;
+                    charger_detach_deadline = None;
+                    usb_detach_uevent_seen = false;
+                }
             } else if should_rearm_public_retry(
                 charger_detach_armed,
                 usb_detach_uevent_seen,
@@ -515,16 +543,16 @@ fn run_unix(
                     charger_detach_deadline.get_or_insert_with(|| Instant::now() + DETACH_DEBOUNCE);
                 if Instant::now() >= *deadline {
                     // A stable offline interval is evidence that the upstream
-                    // charger changed, so start a fresh bounded retry session.
-                    // Resetting here is what lets a later charger in the same
-                    // Type-C attachment (for example 1 -> 3 -> 2 -> 3) get a
-                    // retry even after the previous charger used its budget.
+                    // charger changed, so reserve a fresh bounded session and
+                    // require the replacement charger to pass the Xiaomi-first
+                    // window before allowing public PPS fallback.
                     public_retry_count = 0;
-                    public_retry_attempted = false;
+                    public_retry_attempted = true;
+                    upstream_native_pending = true;
                     charger_detach_armed = false;
                     usb_detach_uevent_seen = false;
                     charger_detach_deadline = None;
-                    info!("[自动] 检测到充电器已从转接设备断开，重置公版PPS重试预算");
+                    info!("[自动] 检测到充电器已从转接设备断开，重置预算并等待小米协议认证");
                 }
             } else {
                 charger_detach_deadline = None;
@@ -535,6 +563,7 @@ fn run_unix(
 
             if retry_failed {
                 public_retry_attempted = false;
+                upstream_native_pending = false;
                 charger_detach_armed = false;
                 usb_detach_uevent_seen = false;
                 charger_detach_deadline = None;
@@ -553,6 +582,7 @@ fn run_unix(
                         info!("[自动] 未检测到小米认证，开始一次公版PPS软件重连");
                         public_retry_count += 1;
                         public_retry_attempted = true;
+                        upstream_native_pending = false;
                         set_input_suspended(true)?;
                         AutoPhase::Suspended(Instant::now() + RECONNECT_STEP_DELAY)
                     } else {
@@ -583,6 +613,7 @@ fn run_unix(
                     info!("[自动] 已连接设备后检测到公版PPS，开始一次软件重连");
                     public_retry_count += 1;
                     public_retry_attempted = true;
+                    upstream_native_pending = false;
                     set_input_suspended(true)?;
                     AutoPhase::Suspended(Instant::now() + RECONNECT_STEP_DELAY)
                 } else {
@@ -613,6 +644,7 @@ mod tests {
     use super::{
         AutoPhase, can_start_public_retry, is_software_reconnect_phase,
         should_process_physical_detach, should_rearm_public_retry,
+        should_start_native_wait_after_upstream_attach,
     };
     use std::time::Instant;
 
@@ -659,6 +691,24 @@ mod tests {
         assert!(can_start_public_retry(0));
         assert!(can_start_public_retry(1));
         assert!(!can_start_public_retry(2));
+    }
+
+    #[test]
+    fn upstream_swap_reenters_native_wait_only_after_charging_returns() {
+        assert!(should_start_native_wait_after_upstream_attach(
+            true, "Charging", "1"
+        ));
+        assert!(!should_start_native_wait_after_upstream_attach(
+            true,
+            "Discharging",
+            "1"
+        ));
+        assert!(!should_start_native_wait_after_upstream_attach(
+            true, "Charging", "0"
+        ));
+        assert!(!should_start_native_wait_after_upstream_attach(
+            false, "Charging", "1"
+        ));
     }
 
     #[test]
