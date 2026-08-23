@@ -8,7 +8,8 @@ use log::{debug, error, info, warn};
 
 #[cfg(unix)]
 use crate::common::constants::{
-    BATTERY_STATUS_PATH, INPUT_SUSPEND_PATH, PD_VERIFIED_PATH, TYPEC_MODE_PATH, USB_REAL_TYPE_PATH,
+    BATTERY_STATUS_PATH, INPUT_SUSPEND_PATH, PD_VERIFIED_PATH, TYPEC_MODE_PATH, USB_ONLINE_PATH,
+    USB_REAL_TYPE_PATH,
 };
 use crate::common::utils;
 #[cfg(unix)]
@@ -67,19 +68,19 @@ fn should_process_physical_detach(
 
 #[cfg(any(unix, test))]
 fn should_rearm_public_retry(
-    phase: AutoPhase,
-    public_retry_attempted: bool,
     charger_detach_armed: bool,
+    usb_detach_uevent_seen: bool,
     verified: &str,
     usb_type: &str,
     battery_status: &str,
+    usb_online: &str,
 ) -> bool {
-    matches!(phase, AutoPhase::Settled)
-        && public_retry_attempted
-        && charger_detach_armed
+    charger_detach_armed
+        && usb_detach_uevent_seen
         && verified == "0"
         && usb_type == "Unknown"
         && battery_status == "Discharging"
+        && usb_online == "0"
 }
 
 pub fn spawn_pd_verified_monitor(
@@ -231,6 +232,7 @@ fn run_unix(
     // produced a confirmed Charging state.  During negotiation, Unknown and
     // Discharging are normal transient values and must not reopen the retry.
     let mut charger_detach_armed = false;
+    let mut usb_detach_uevent_seen = false;
     let mut charger_detach_deadline = None;
     // input_suspend can briefly make typec_mode report "Nothing attached".
     // Keep physical-detach handling disabled until the node settles after the
@@ -326,6 +328,7 @@ fn run_unix(
             detach_deadline = None;
             public_retry_attempted = false;
             charger_detach_armed = false;
+            usb_detach_uevent_seen = false;
             charger_detach_deadline = None;
             reconnect_grace_deadline = None;
             phase = match (mode, attached) {
@@ -355,7 +358,7 @@ fn run_unix(
             // Drain every queued netlink datagram so epoll cannot spin on stale events.
             let mut buffer = [0u8; 4096];
             loop {
-                let read = unsafe {
+                let bytes_read = unsafe {
                     libc::recv(
                         uevent_sock,
                         buffer.as_mut_ptr().cast::<libc::c_void>(),
@@ -363,8 +366,19 @@ fn run_unix(
                         libc::MSG_DONTWAIT,
                     )
                 };
-                if read <= 0 {
+                if bytes_read <= 0 {
                     break;
+                }
+
+                let data = String::from_utf8_lossy(&buffer[..bytes_read as usize]);
+                let is_usb_power_supply = data
+                    .split(['\0', '\n'])
+                    .any(|field| field == "POWER_SUPPLY_NAME=usb");
+                let usb_online = data
+                    .split(['\0', '\n'])
+                    .find_map(|field| field.strip_prefix("POWER_SUPPLY_ONLINE="));
+                if is_usb_power_supply && usb_online == Some("0") {
+                    usb_detach_uevent_seen = true;
                 }
             }
             // The first read below may race the driver update. Arm one bounded
@@ -400,6 +414,7 @@ fn run_unix(
                 }
                 public_retry_attempted = false;
                 charger_detach_armed = false;
+                usb_detach_uevent_seen = false;
                 charger_detach_deadline = None;
                 reconnect_grace_deadline = None;
                 stop_charging_session(
@@ -415,6 +430,7 @@ fn run_unix(
                 attached = true;
                 public_retry_attempted = false;
                 charger_detach_armed = false;
+                usb_detach_uevent_seen = false;
                 charger_detach_deadline = None;
                 reconnect_grace_deadline = None;
                 if mode == ChargingMode::Automatic {
@@ -434,6 +450,7 @@ fn run_unix(
 
         if mode != ChargingMode::Automatic || !attached {
             charger_detach_armed = false;
+            usb_detach_uevent_seen = false;
             charger_detach_deadline = None;
             reconnect_grace_deadline = None;
             continue;
@@ -446,31 +463,41 @@ fn run_unix(
         if matches!(phase, AutoPhase::Settled) && public_retry_attempted {
             let verified = FileMonitor::read_file_content(PD_VERIFIED_PATH)?;
             let usb_type = FileMonitor::read_file_content(USB_REAL_TYPE_PATH)?;
-            let battery_status = FileMonitor::read_file_content(BATTERY_STATUS_PATH)?;
+            // These optional power-supply nodes are not exposed on every
+            // Qualcomm device. Missing values must disable swap recovery, not
+            // terminate the monitor thread.
+            let battery_status =
+                FileMonitor::read_file_content(BATTERY_STATUS_PATH).unwrap_or_default();
+            let usb_online = FileMonitor::read_file_content(USB_ONLINE_PATH).unwrap_or_default();
             if battery_status == "Charging" {
                 if !charger_detach_armed {
                     debug!("[自动] 公版PPS重连后确认仍在充电，启用上游断开检测");
                 }
                 charger_detach_armed = true;
+                usb_detach_uevent_seen = false;
                 charger_detach_deadline = None;
             } else if should_rearm_public_retry(
-                phase,
-                public_retry_attempted,
                 charger_detach_armed,
+                usb_detach_uevent_seen,
                 &verified,
                 &usb_type,
                 &battery_status,
+                &usb_online,
             ) {
                 let deadline =
                     charger_detach_deadline.get_or_insert_with(|| Instant::now() + DETACH_DEBOUNCE);
                 if Instant::now() >= *deadline {
                     public_retry_attempted = false;
                     charger_detach_armed = false;
+                    usb_detach_uevent_seen = false;
                     charger_detach_deadline = None;
                     info!("[自动] 检测到充电器已从转接设备断开，允许下次公版PPS重连");
                 }
             } else {
                 charger_detach_deadline = None;
+                if usb_online != "0" {
+                    usb_detach_uevent_seen = false;
+                }
             }
         } else {
             charger_detach_deadline = None;
@@ -487,6 +514,7 @@ fn run_unix(
                         info!("[自动] 未检测到小米认证，开始一次公版PPS软件重连");
                         public_retry_attempted = true;
                         charger_detach_armed = false;
+                        usb_detach_uevent_seen = false;
                         set_input_suspended(true)?;
                         AutoPhase::Suspended(Instant::now() + RECONNECT_STEP_DELAY)
                     } else {
@@ -514,6 +542,7 @@ fn run_unix(
                     info!("[自动] 已连接设备后检测到公版PPS，开始一次软件重连");
                     public_retry_attempted = true;
                     charger_detach_armed = false;
+                    usb_detach_uevent_seen = false;
                     set_input_suspended(true)?;
                     AutoPhase::Suspended(Instant::now() + RECONNECT_STEP_DELAY)
                 } else {
@@ -588,28 +617,39 @@ mod tests {
     #[test]
     fn upstream_retry_rearm_requires_confirmed_charge_then_discharge() {
         assert!(!should_rearm_public_retry(
-            AutoPhase::Settled,
+            false,
+            false,
+            "0",
+            "Unknown",
+            "Discharging",
+            "0"
+        ));
+        assert!(!should_rearm_public_retry(
+            true, true, "0", "Unknown", "Charging", "0"
+        ));
+        assert!(!should_rearm_public_retry(
             true,
             false,
             "0",
             "Unknown",
-            "Discharging"
+            "Discharging",
+            "0"
         ));
         assert!(!should_rearm_public_retry(
-            AutoPhase::Settled,
             true,
             true,
             "0",
             "Unknown",
-            "Charging"
+            "Discharging",
+            "1"
         ));
         assert!(should_rearm_public_retry(
-            AutoPhase::Settled,
             true,
             true,
             "0",
             "Unknown",
-            "Discharging"
+            "Discharging",
+            "0"
         ));
     }
 }
