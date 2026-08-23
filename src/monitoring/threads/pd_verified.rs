@@ -11,10 +11,13 @@ use crate::common::constants::{
     BATTERY_STATUS_PATH, INPUT_SUSPEND_PATH, PD_VERIFIED_PATH, TYPEC_MODE_PATH, USB_REAL_TYPE_PATH,
 };
 use crate::common::utils;
+#[cfg(unix)]
 use crate::monitoring::ChargingMode;
 #[cfg(unix)]
 use crate::monitoring::FileMonitor;
-use crate::pd::{BroadcastForger, PdVerifier, spawn_broadcast_forger_worker};
+use crate::pd::PdVerifier;
+#[cfg(unix)]
+use crate::pd::{BroadcastForger, spawn_broadcast_forger_worker};
 use crate::platform::EventFd;
 
 const NATIVE_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(4);
@@ -42,6 +45,41 @@ impl AutoPhase {
             Self::Idle | Self::Settled => None,
         }
     }
+}
+
+#[cfg(any(unix, test))]
+fn is_software_reconnect_phase(phase: AutoPhase) -> bool {
+    matches!(phase, AutoPhase::Suspended(_) | AutoPhase::PublicEnabled(_))
+}
+
+#[cfg(any(unix, test))]
+fn should_process_physical_detach(
+    attached: bool,
+    physically_attached: bool,
+    phase: AutoPhase,
+    reconnect_grace_active: bool,
+) -> bool {
+    attached
+        && !physically_attached
+        && !is_software_reconnect_phase(phase)
+        && !reconnect_grace_active
+}
+
+#[cfg(any(unix, test))]
+fn should_rearm_public_retry(
+    phase: AutoPhase,
+    public_retry_attempted: bool,
+    charger_detach_armed: bool,
+    verified: &str,
+    usb_type: &str,
+    battery_status: &str,
+) -> bool {
+    matches!(phase, AutoPhase::Settled)
+        && public_retry_attempted
+        && charger_detach_armed
+        && verified == "0"
+        && usb_type == "Unknown"
+        && battery_status == "Discharging"
 }
 
 pub fn spawn_pd_verified_monitor(
@@ -113,12 +151,14 @@ fn epoll_timeout(
     detach_deadline: Option<Instant>,
     uevent_recheck_deadline: Option<Instant>,
     charger_detach_deadline: Option<Instant>,
+    reconnect_grace_deadline: Option<Instant>,
 ) -> libc::c_int {
     let deadline = [
         phase.deadline(),
         detach_deadline,
         uevent_recheck_deadline,
         charger_detach_deadline,
+        reconnect_grace_deadline,
     ]
     .into_iter()
     .flatten()
@@ -187,7 +227,15 @@ fn run_unix(
     };
     let mut uevent_recheck_deadline = None;
     let mut public_retry_attempted = false;
+    // Upstream charger-detach recovery is armed only after this retry has
+    // produced a confirmed Charging state.  During negotiation, Unknown and
+    // Discharging are normal transient values and must not reopen the retry.
+    let mut charger_detach_armed = false;
     let mut charger_detach_deadline = None;
+    // input_suspend can briefly make typec_mode report "Nothing attached".
+    // Keep physical-detach handling disabled until the node settles after the
+    // intentional reconnect.
+    let mut reconnect_grace_deadline = None;
 
     // Preserve upstream's SystemUI gold-label/100 W broadcast feature. The
     // worker is only activated for a charging session and exits with the daemon.
@@ -226,6 +274,7 @@ fn run_unix(
                 detach_deadline,
                 uevent_recheck_deadline,
                 charger_detach_deadline,
+                reconnect_grace_deadline,
             ),
         ) {
             Ok(count) => count,
@@ -276,7 +325,9 @@ fn run_unix(
             attached = is_attached()?;
             detach_deadline = None;
             public_retry_attempted = false;
+            charger_detach_armed = false;
             charger_detach_deadline = None;
+            reconnect_grace_deadline = None;
             phase = match (mode, attached) {
                 (ChargingMode::Automatic, true) => {
                     AutoPhase::WaitingNative(Instant::now() + NATIVE_NEGOTIATION_TIMEOUT)
@@ -324,22 +375,33 @@ fn run_unix(
         if uevent_recheck_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             uevent_recheck_deadline = None;
         }
+        if reconnect_grace_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            reconnect_grace_deadline = None;
+        }
 
         let physically_attached = is_attached()?;
-        if attached && !physically_attached {
+        let reconnect_grace_active = reconnect_grace_deadline.is_some();
+        if is_software_reconnect_phase(phase) || reconnect_grace_active {
+            detach_deadline = None;
+        }
+        if should_process_physical_detach(
+            attached,
+            physically_attached,
+            phase,
+            reconnect_grace_active,
+        ) {
             let deadline = detach_deadline.get_or_insert(Instant::now() + DETACH_DEBOUNCE);
             if Instant::now() >= *deadline {
                 attached = false;
                 detach_deadline = None;
-                if matches!(phase, AutoPhase::Suspended(_) | AutoPhase::PublicEnabled(_)) {
-                    set_input_suspended(false)?;
-                }
                 if mode == ChargingMode::Automatic {
                     pd_verifier.set_pd_verified(false)?;
                     info!("[自动] 已拔出，恢复小米协议优先基线");
                 }
                 public_retry_attempted = false;
+                charger_detach_armed = false;
                 charger_detach_deadline = None;
+                reconnect_grace_deadline = None;
                 stop_charging_session(
                     &mut charging_session_active,
                     &session_active,
@@ -352,7 +414,9 @@ fn run_unix(
             if !attached {
                 attached = true;
                 public_retry_attempted = false;
+                charger_detach_armed = false;
                 charger_detach_deadline = None;
+                reconnect_grace_deadline = None;
                 if mode == ChargingMode::Automatic {
                     phase = AutoPhase::WaitingNative(Instant::now() + NATIVE_NEGOTIATION_TIMEOUT);
                     info!("[自动] 检测到连接，等待小米协议认证");
@@ -369,7 +433,9 @@ fn run_unix(
         }
 
         if mode != ChargingMode::Automatic || !attached {
+            charger_detach_armed = false;
             charger_detach_deadline = None;
+            reconnect_grace_deadline = None;
             continue;
         }
 
@@ -380,11 +446,26 @@ fn run_unix(
         if matches!(phase, AutoPhase::Settled) && public_retry_attempted {
             let verified = FileMonitor::read_file_content(PD_VERIFIED_PATH)?;
             let usb_type = FileMonitor::read_file_content(USB_REAL_TYPE_PATH)?;
-            if verified == "0" && usb_type == "Unknown" {
+            let battery_status = FileMonitor::read_file_content(BATTERY_STATUS_PATH)?;
+            if battery_status == "Charging" {
+                if !charger_detach_armed {
+                    debug!("[自动] 公版PPS重连后确认仍在充电，启用上游断开检测");
+                }
+                charger_detach_armed = true;
+                charger_detach_deadline = None;
+            } else if should_rearm_public_retry(
+                phase,
+                public_retry_attempted,
+                charger_detach_armed,
+                &verified,
+                &usb_type,
+                &battery_status,
+            ) {
                 let deadline =
                     charger_detach_deadline.get_or_insert_with(|| Instant::now() + DETACH_DEBOUNCE);
                 if Instant::now() >= *deadline {
                     public_retry_attempted = false;
+                    charger_detach_armed = false;
                     charger_detach_deadline = None;
                     info!("[自动] 检测到充电器已从转接设备断开，允许下次公版PPS重连");
                 }
@@ -405,6 +486,7 @@ fn run_unix(
                     if usb_type == "PD_PPS" {
                         info!("[自动] 未检测到小米认证，开始一次公版PPS软件重连");
                         public_retry_attempted = true;
+                        charger_detach_armed = false;
                         set_input_suspended(true)?;
                         AutoPhase::Suspended(Instant::now() + RECONNECT_STEP_DELAY)
                     } else {
@@ -421,6 +503,7 @@ fn run_unix(
             }
             AutoPhase::PublicEnabled(deadline) if Instant::now() >= deadline => {
                 set_input_suspended(false)?;
+                reconnect_grace_deadline = Some(Instant::now() + DETACH_DEBOUNCE);
                 info!("[自动] 公版PPS软件重连完成，本次连接不再重试");
                 AutoPhase::Settled
             }
@@ -430,6 +513,7 @@ fn run_unix(
                 if verified != "1" && usb_type == "PD_PPS" {
                     info!("[自动] 已连接设备后检测到公版PPS，开始一次软件重连");
                     public_retry_attempted = true;
+                    charger_detach_armed = false;
                     set_input_suspended(true)?;
                     AutoPhase::Suspended(Instant::now() + RECONNECT_STEP_DELAY)
                 } else {
@@ -453,6 +537,81 @@ fn run_unix(
         error!("broadcast-forger线程join失败: {:?}", error);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AutoPhase, is_software_reconnect_phase, should_process_physical_detach,
+        should_rearm_public_retry,
+    };
+    use std::time::Instant;
+
+    #[test]
+    fn intentional_reconnect_suspend_is_not_a_physical_detach() {
+        assert!(is_software_reconnect_phase(AutoPhase::Suspended(
+            Instant::now()
+        )));
+        assert!(is_software_reconnect_phase(AutoPhase::PublicEnabled(
+            Instant::now()
+        )));
+        assert!(!should_process_physical_detach(
+            true,
+            false,
+            AutoPhase::Suspended(Instant::now()),
+            false
+        ));
+        assert!(!should_process_physical_detach(
+            true,
+            false,
+            AutoPhase::PublicEnabled(Instant::now()),
+            false
+        ));
+        assert!(!should_process_physical_detach(
+            true,
+            false,
+            AutoPhase::Settled,
+            true
+        ));
+    }
+
+    #[test]
+    fn physical_detach_is_still_processed_after_reconnect_settles() {
+        assert!(should_process_physical_detach(
+            true,
+            false,
+            AutoPhase::Settled,
+            false
+        ));
+    }
+
+    #[test]
+    fn upstream_retry_rearm_requires_confirmed_charge_then_discharge() {
+        assert!(!should_rearm_public_retry(
+            AutoPhase::Settled,
+            true,
+            false,
+            "0",
+            "Unknown",
+            "Discharging"
+        ));
+        assert!(!should_rearm_public_retry(
+            AutoPhase::Settled,
+            true,
+            true,
+            "0",
+            "Unknown",
+            "Charging"
+        ));
+        assert!(should_rearm_public_retry(
+            AutoPhase::Settled,
+            true,
+            true,
+            "0",
+            "Unknown",
+            "Discharging"
+        ));
+    }
 }
 
 #[cfg(unix)]
