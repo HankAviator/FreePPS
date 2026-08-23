@@ -98,6 +98,15 @@ fn should_start_native_wait_after_upstream_attach(
     upstream_native_pending && battery_status == "Charging" && usb_online == "1"
 }
 
+#[cfg(any(unix, test))]
+fn should_capture_upstream_detach(
+    phase: AutoPhase,
+    charger_detach_armed: bool,
+    reconnect_grace_active: bool,
+) -> bool {
+    matches!(phase, AutoPhase::Settled) && charger_detach_armed && !reconnect_grace_active
+}
+
 pub fn spawn_pd_verified_monitor(
     running: Arc<AtomicBool>,
     pd_verifier: Arc<PdVerifier>,
@@ -379,10 +388,11 @@ fn run_unix(
 
         if uevent_registered && ready.iter().any(|event| event.u64 == uevent_sock as u64) {
             // Drain every queued netlink datagram so epoll cannot spin on stale events.
-            let capture_upstream_detach = matches!(phase, AutoPhase::Settled)
-                && public_retry_attempted
-                && charger_detach_armed
-                && reconnect_grace_deadline.is_none();
+            let capture_upstream_detach = should_capture_upstream_detach(
+                phase,
+                charger_detach_armed,
+                reconnect_grace_deadline.is_some(),
+            );
             let mut buffer = [0u8; 4096];
             loop {
                 let bytes_read = unsafe {
@@ -496,17 +506,18 @@ fn run_unix(
         }
 
         // A USB meter can keep Type-C physically attached while its upstream
-        // charger is unplugged. Only accept that as a new session after a
-        // completed retry has produced stable Charging, and only while the
-        // monitor is settled (never during input_suspend). This preserves
-        // charger-swap support without treating our own reconnect as a detach.
-        if matches!(phase, AutoPhase::Settled) && public_retry_attempted {
+        // charger is unplugged. Arm this for any stable Xiaomi or public-PPS
+        // session, and only accept a swap while settled (never during
+        // input_suspend). This preserves charger-swap support without
+        // treating our own reconnect as a detach.
+        if matches!(phase, AutoPhase::Settled) {
             let verified = FileMonitor::read_file_content(PD_VERIFIED_PATH)?;
             let usb_type = FileMonitor::read_file_content(USB_REAL_TYPE_PATH)?;
             let battery_status =
                 FileMonitor::read_file_content(BATTERY_STATUS_PATH).unwrap_or_default();
             let usb_online = FileMonitor::read_file_content(USB_ONLINE_PATH).unwrap_or_default();
-            let retry_failed = battery_status == "Charging"
+            let retry_failed = public_retry_attempted
+                && battery_status == "Charging"
                 && usb_online == "1"
                 && verified != "1"
                 && usb_type == "PD_PPS"
@@ -526,7 +537,7 @@ fn run_unix(
                 info!("[自动] 检测到新充电器，重新等待小米协议认证");
             } else if battery_status == "Charging" && usb_online == "1" {
                 if !charger_detach_armed {
-                    debug!("[自动] 公版PPS重连后确认仍在充电，启用上游断开检测");
+                    debug!("[自动] 充电稳定，启用上游断开检测");
                     charger_detach_armed = true;
                     charger_detach_deadline = None;
                     usb_detach_uevent_seen = false;
@@ -643,7 +654,7 @@ fn run_unix(
 mod tests {
     use super::{
         AutoPhase, can_start_public_retry, is_software_reconnect_phase,
-        should_process_physical_detach, should_rearm_public_retry,
+        should_capture_upstream_detach, should_process_physical_detach, should_rearm_public_retry,
         should_start_native_wait_after_upstream_attach,
     };
     use std::time::Instant;
@@ -708,6 +719,30 @@ mod tests {
         ));
         assert!(!should_start_native_wait_after_upstream_attach(
             false, "Charging", "1"
+        ));
+    }
+
+    #[test]
+    fn stable_native_or_public_sessions_can_capture_upstream_detach() {
+        assert!(should_capture_upstream_detach(
+            AutoPhase::Settled,
+            true,
+            false
+        ));
+        assert!(!should_capture_upstream_detach(
+            AutoPhase::Settled,
+            false,
+            false
+        ));
+        assert!(!should_capture_upstream_detach(
+            AutoPhase::PublicEnabled(Instant::now()),
+            true,
+            false
+        ));
+        assert!(!should_capture_upstream_detach(
+            AutoPhase::Settled,
+            true,
+            true
         ));
     }
 
