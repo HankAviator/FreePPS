@@ -4,11 +4,12 @@ mod pd;
 mod platform;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::thread;
+#[cfg(not(unix))]
 use std::time::Duration;
 
-use common::constants::{FREE_FILE, PD_ADAPTER_VERIFIED_PATH, PD_VERIFIED_PATH};
+use common::constants::{PD_ADAPTER_VERIFIED_PATH, PD_VERIFIED_PATH};
 use common::utils;
 use log::{error, info};
 use monitoring::{
@@ -16,7 +17,7 @@ use monitoring::{
     spawn_pd_adapter_verified_monitor, spawn_pd_verified_monitor,
 };
 use pd::{PdAdapterVerifier, PdVerifier};
-use platform::install_signal_handlers;
+use platform::{EventFd, SignalWaiter, install_signal_handlers};
 
 fn main() {
     // 初始化 Android Logger
@@ -33,44 +34,58 @@ fn main() {
     let module_manager = Arc::new(ModuleManager::new().expect("创建模块管理器失败"));
 
     // 初始化阶段：确保基础文件存在并设置初始状态
-    if let Err(e) = module_manager.initialize_module() {
+    let initial_mode = module_manager.initialize_module().unwrap_or_else(|e| {
         error!("模块初始化失败: {}", e);
-    }
+        monitoring::ChargingMode::Native
+    });
 
     // 创建运行标志
     let running = Arc::new(AtomicBool::new(true));
-    install_signal_handlers(&running);
+    let signal_waiter = SignalWaiter::new().expect("创建信号事件失败");
+    install_signal_handlers(&running, &signal_waiter);
 
     let pd_verifier = Arc::new(PdVerifier::new().expect("创建PD验证器失败"));
     let pd_adapter_verifier = Arc::new(PdAdapterVerifier::new().expect("创建PD适配器验证器失败"));
 
-    let free_enabled = Arc::new(AtomicBool::new(
-        monitoring::FileMonitor::read_file_content(FREE_FILE).unwrap_or_else(|_| "0".to_string())
-            == "1",
-    ));
+    let charging_mode = Arc::new(AtomicU8::new(initial_mode as u8));
+    let qcom_config_event = Arc::new(EventFd::new().expect("创建qcom配置事件失败"));
+    let mtk_config_event = Arc::new(EventFd::new().expect("创建mtk配置事件失败"));
 
     let mut thread_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+    let mut stop_events: Vec<Arc<EventFd>> = Vec::new();
 
     // 创建free文件监控线程
+    let free_stop_event = Arc::new(EventFd::new().expect("创建free线程停止事件失败"));
+    stop_events.push(Arc::clone(&free_stop_event));
     thread_handles.push(spawn_free_file_monitor(
         Arc::clone(&running),
         Arc::clone(&module_manager),
-        Arc::clone(&free_enabled),
+        Arc::clone(&charging_mode),
+        Arc::clone(&qcom_config_event),
+        Arc::clone(&mtk_config_event),
+        free_stop_event,
     ));
 
     // 创建disable文件监控线程
+    let disable_stop_event = Arc::new(EventFd::new().expect("创建disable线程停止事件失败"));
+    stop_events.push(Arc::clone(&disable_stop_event));
     thread_handles.push(spawn_disable_file_monitor(
         Arc::clone(&running),
         Arc::clone(&module_manager),
+        disable_stop_event,
     ));
 
     // 初始化时按节点存在性一次性创建 qcom/mtk 线程（不做后续轮询判断/重启）
     if std::path::Path::new(PD_VERIFIED_PATH).exists() {
         info!("检测到qcom节点存在，启动qcom线程: {}", PD_VERIFIED_PATH);
+        let qcom_stop_event = Arc::new(EventFd::new().expect("创建qcom线程停止事件失败"));
+        stop_events.push(Arc::clone(&qcom_stop_event));
         thread_handles.push(spawn_pd_verified_monitor(
             Arc::clone(&running),
             Arc::clone(&pd_verifier),
-            Arc::clone(&free_enabled),
+            Arc::clone(&charging_mode),
+            Arc::clone(&qcom_config_event),
+            qcom_stop_event,
         ));
     } else {
         info!("qcom节点不存在，跳过qcom线程启动: {}", PD_VERIFIED_PATH);
@@ -81,10 +96,14 @@ fn main() {
             "检测到mtk节点存在，启动mtk线程: {}",
             PD_ADAPTER_VERIFIED_PATH
         );
+        let mtk_stop_event = Arc::new(EventFd::new().expect("创建mtk线程停止事件失败"));
+        stop_events.push(Arc::clone(&mtk_stop_event));
         thread_handles.push(spawn_pd_adapter_verified_monitor(
             Arc::clone(&running),
             Arc::clone(&pd_adapter_verifier),
-            Arc::clone(&free_enabled),
+            Arc::clone(&charging_mode),
+            Arc::clone(&mtk_config_event),
+            mtk_stop_event,
         ));
     } else {
         info!(
@@ -94,15 +113,28 @@ fn main() {
     }
 
     info!(
-        "[{}] 监控线程已按需启动（仅初始化判断一次），主线程park等待...",
+        "[{}] 监控线程已按需启动（仅初始化判断一次），主线程等待退出信号...",
         main_thread_name
     );
+
+    #[cfg(unix)]
+    if let Err(error) = signal_waiter.wait() {
+        error!("等待退出信号失败: {}", error);
+    }
+
+    #[cfg(not(unix))]
     while running.load(std::sync::atomic::Ordering::Relaxed) {
         thread::park_timeout(Duration::from_secs(1));
     }
 
     info!("检测到退出信号，开始停止所有监控线程...");
     running.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    for stop_event in &stop_events {
+        if let Err(error) = stop_event.notify() {
+            error!("通知监控线程停止失败: {}", error);
+        }
+    }
 
     for handle in thread_handles {
         if let Err(e) = handle.join() {
