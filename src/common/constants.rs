@@ -22,7 +22,6 @@ pub const BATTERY_STATUS_PATH: &str = "/sys/class/power_supply/battery/status";
 pub const INPUT_SUSPEND_PATH: &str = "/sys/class/qcom-battery/input_suspend";
 pub const TYPEC_MODE_PATH: &str = "/sys/class/qcom-battery/typec_mode";
 pub const USB_REAL_TYPE_PATH: &str = "/sys/class/qcom-battery/usb_real_type";
-pub const USB_ONLINE_PATH: &str = "/sys/class/power_supply/usb/online";
 
 // 金标动画广播伪造相关 sysfs 节点
 #[cfg(unix)]
