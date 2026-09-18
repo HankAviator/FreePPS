@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.8.1 — 2026-09-18
+
+- Fix Qualcomm Auto mode falling back from an available public-PPS contract to fixed-voltage PD.
+- Enable public PPS in place after the Xiaomi-first detection window instead of simulating a cable reconnect with `input_suspend`.
+- Verify both the PD verification node and negotiated USB type before reporting Auto-mode success.
+
 ## v1.8.0 — 2026-08-23
 
 - Improve Qualcomm automatic protocol detection during charger and power-bank swaps.
