@@ -8,7 +8,8 @@ use log::{debug, error, info, warn};
 
 #[cfg(unix)]
 use crate::common::constants::{
-    BATTERY_STATUS_PATH, PD_VERIFIED_PATH, TYPEC_MODE_PATH, USB_ONLINE_PATH, USB_REAL_TYPE_PATH,
+    BATTERY_STATUS_PATH, PD_VERIFIED_PATH, QCOM_ADAPTER_SVID_PATH, TYPEC_MODE_PATH,
+    USB_ONLINE_PATH, USB_REAL_TYPE_PATH,
 };
 use crate::common::utils;
 #[cfg(unix)]
@@ -21,7 +22,11 @@ use crate::pd::{BroadcastForger, spawn_broadcast_forger_worker};
 use crate::platform::EventFd;
 
 const NATIVE_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(4);
-const PUBLIC_ACTIVATION_DELAY: Duration = Duration::from_secs(2);
+const PUBLIC_IDENTITY_SETTLE: Duration = Duration::from_millis(400);
+const PUBLIC_IDENTITY_WINDOW: Duration = Duration::from_secs(1);
+const PUBLIC_IDENTITY_RECHECK: Duration = Duration::from_millis(100);
+const PUBLIC_REASSERT_DELAY: Duration = Duration::from_millis(500);
+const PUBLIC_VERIFY_DELAY: Duration = Duration::from_millis(1500);
 const DETACH_DEBOUNCE: Duration = Duration::from_millis(1500);
 // A USB meter/adapter can keep Type-C attached while its upstream charger is
 // swapped. The retry budget therefore belongs to the current upstream charger
@@ -31,15 +36,24 @@ const MAX_PUBLIC_RETRIES_PER_UPSTREAM_SESSION: u8 = 2;
 #[derive(Clone, Copy, Debug)]
 enum AutoPhase {
     Idle,
+    IdentifyingPublic {
+        next_check: Instant,
+        identity_deadline: Instant,
+        native_deadline: Instant,
+    },
     WaitingNative(Instant),
     EnablingPublic(Instant),
+    VerifyingPublic(Instant),
     Settled,
 }
 
 impl AutoPhase {
     fn deadline(self) -> Option<Instant> {
         match self {
-            Self::WaitingNative(deadline) | Self::EnablingPublic(deadline) => Some(deadline),
+            Self::IdentifyingPublic { next_check, .. } => Some(next_check),
+            Self::WaitingNative(deadline)
+            | Self::EnablingPublic(deadline)
+            | Self::VerifyingPublic(deadline) => Some(deadline),
             Self::Idle | Self::Settled => None,
         }
     }
@@ -53,6 +67,19 @@ fn should_process_physical_detach(attached: bool, physically_attached: bool) -> 
 #[cfg(any(unix, test))]
 fn public_pps_activation_succeeded(verified: &str, usb_type: &str) -> bool {
     verified == "1" && usb_type == "PD_PPS"
+}
+
+#[cfg(any(unix, test))]
+fn should_enable_public_early(verified: &str, usb_type: &str, adapter_svid: &str) -> bool {
+    verified != "1" && usb_type == "PD_PPS" && adapter_svid == "0000"
+}
+
+fn automatic_attach_phase(now: Instant) -> AutoPhase {
+    AutoPhase::IdentifyingPublic {
+        next_check: now + PUBLIC_IDENTITY_SETTLE,
+        identity_deadline: now + PUBLIC_IDENTITY_WINDOW,
+        native_deadline: now + NATIVE_NEGOTIATION_TIMEOUT,
+    }
 }
 
 #[cfg(any(unix, test))]
@@ -222,9 +249,7 @@ fn run_unix(
     let mut attached = is_attached()?;
     let mut detach_deadline = None;
     let mut phase = match (mode, attached) {
-        (ChargingMode::Automatic, true) => {
-            AutoPhase::WaitingNative(Instant::now() + NATIVE_NEGOTIATION_TIMEOUT)
-        }
+        (ChargingMode::Automatic, true) => automatic_attach_phase(Instant::now()),
         _ => AutoPhase::Idle,
     };
     // Bound retries per upstream charger session. A second attempt is
@@ -331,9 +356,7 @@ fn run_unix(
             charger_detach_deadline = None;
             uevent_recheck_deadline = None;
             phase = match (mode, attached) {
-                (ChargingMode::Automatic, true) => {
-                    AutoPhase::WaitingNative(Instant::now() + NATIVE_NEGOTIATION_TIMEOUT)
-                }
+                (ChargingMode::Automatic, true) => automatic_attach_phase(Instant::now()),
                 _ => AutoPhase::Idle,
             };
             if uevent_registered && attached {
@@ -430,8 +453,8 @@ fn run_unix(
                 charger_detach_deadline = None;
                 uevent_recheck_deadline = None;
                 if mode == ChargingMode::Automatic {
-                    phase = AutoPhase::WaitingNative(Instant::now() + NATIVE_NEGOTIATION_TIMEOUT);
-                    info!("[自动] 检测到连接，等待小米协议认证");
+                    phase = automatic_attach_phase(Instant::now());
+                    info!("[自动] 检测到连接，识别充电器并优先等待小米协议认证");
                 }
                 if mode != ChargingMode::Native {
                     start_charging_session(
@@ -480,8 +503,8 @@ fn run_unix(
                 charger_detach_armed = false;
                 charger_detach_deadline = None;
                 usb_detach_uevent_seen = false;
-                phase = AutoPhase::WaitingNative(Instant::now() + NATIVE_NEGOTIATION_TIMEOUT);
-                info!("[自动] 检测到新充电器，重新等待小米协议认证");
+                phase = automatic_attach_phase(Instant::now());
+                info!("[自动] 检测到新充电器，重新识别协议并优先等待小米认证");
             } else if battery_status == "Charging" && usb_online == "1" {
                 if !charger_detach_armed {
                     debug!("[自动] 充电稳定，启用上游断开检测");
@@ -530,6 +553,49 @@ fn run_unix(
         }
 
         phase = match phase {
+            AutoPhase::IdentifyingPublic {
+                next_check,
+                identity_deadline,
+                native_deadline,
+            } => {
+                let verified = FileMonitor::read_file_content(PD_VERIFIED_PATH)?;
+                if verified == "1" {
+                    info!("[自动] 小米协议认证成功，保持原生协商");
+                    AutoPhase::Settled
+                } else if Instant::now() >= next_check {
+                    let usb_type = FileMonitor::read_file_content(USB_REAL_TYPE_PATH)?;
+                    let adapter_svid =
+                        FileMonitor::read_file_content(QCOM_ADAPTER_SVID_PATH).unwrap_or_default();
+                    if should_enable_public_early(&verified, &usb_type, &adapter_svid)
+                        && can_start_public_retry(public_retry_count)
+                    {
+                        info!("[自动] 提前识别到公版PPS，立即启用以保留高功率协商窗口");
+                        public_retry_count += 1;
+                        public_retry_attempted = true;
+                        upstream_native_pending = false;
+                        pd_verifier.set_pd_verified(true)?;
+                        AutoPhase::EnablingPublic(Instant::now() + PUBLIC_REASSERT_DELAY)
+                    } else if !adapter_svid.is_empty() && adapter_svid != "0000" {
+                        debug!("[自动] 检测到厂商SVID={}，继续等待小米认证", adapter_svid);
+                        AutoPhase::WaitingNative(native_deadline)
+                    } else if Instant::now() < identity_deadline {
+                        AutoPhase::IdentifyingPublic {
+                            next_check: (Instant::now() + PUBLIC_IDENTITY_RECHECK)
+                                .min(identity_deadline),
+                            identity_deadline,
+                            native_deadline,
+                        }
+                    } else {
+                        AutoPhase::WaitingNative(native_deadline)
+                    }
+                } else {
+                    AutoPhase::IdentifyingPublic {
+                        next_check,
+                        identity_deadline,
+                        native_deadline,
+                    }
+                }
+            }
             AutoPhase::WaitingNative(deadline) => {
                 if FileMonitor::read_file_content(PD_VERIFIED_PATH)? == "1" {
                     info!("[自动] 小米协议认证成功，保持原生协商");
@@ -542,7 +608,7 @@ fn run_unix(
                         public_retry_attempted = true;
                         upstream_native_pending = false;
                         pd_verifier.set_pd_verified(true)?;
-                        AutoPhase::EnablingPublic(Instant::now() + PUBLIC_ACTIVATION_DELAY)
+                        AutoPhase::EnablingPublic(Instant::now() + PUBLIC_REASSERT_DELAY)
                     } else {
                         warn!("[自动] 未认证且接口类型为{}，本次不强制切换", usb_type);
                         AutoPhase::Settled
@@ -552,6 +618,14 @@ fn run_unix(
                 }
             }
             AutoPhase::EnablingPublic(deadline) if Instant::now() >= deadline => {
+                // Xiaomi's PD state machine can clear the first write while it
+                // transitions into charge-pump mode. Reassert once inside the
+                // measured high-power decision window, then verify later.
+                pd_verifier.set_pd_verified(true)?;
+                debug!("[自动] 在高功率协商窗口内再次确认公版PPS状态");
+                AutoPhase::VerifyingPublic(Instant::now() + PUBLIC_VERIFY_DELAY)
+            }
+            AutoPhase::VerifyingPublic(deadline) if Instant::now() >= deadline => {
                 let verified = FileMonitor::read_file_content(PD_VERIFIED_PATH)?;
                 let usb_type = FileMonitor::read_file_content(USB_REAL_TYPE_PATH)?;
                 if public_pps_activation_succeeded(&verified, &usb_type) {
@@ -582,7 +656,7 @@ fn run_unix(
                     public_retry_attempted = true;
                     upstream_native_pending = false;
                     pd_verifier.set_pd_verified(true)?;
-                    AutoPhase::EnablingPublic(Instant::now() + PUBLIC_ACTIVATION_DELAY)
+                    AutoPhase::EnablingPublic(Instant::now() + PUBLIC_REASSERT_DELAY)
                 } else {
                     AutoPhase::Settled
                 }
@@ -607,8 +681,8 @@ fn run_unix(
 mod tests {
     use super::{
         AutoPhase, can_start_public_retry, public_pps_activation_succeeded,
-        should_capture_upstream_detach, should_process_physical_detach, should_rearm_public_retry,
-        should_start_native_wait_after_upstream_attach,
+        should_capture_upstream_detach, should_enable_public_early, should_process_physical_detach,
+        should_rearm_public_retry, should_start_native_wait_after_upstream_attach,
     };
     use std::time::Instant;
 
@@ -624,6 +698,15 @@ mod tests {
         assert!(public_pps_activation_succeeded("1", "PD_PPS"));
         assert!(!public_pps_activation_succeeded("1", "PD"));
         assert!(!public_pps_activation_succeeded("0", "PD_PPS"));
+    }
+
+    #[test]
+    fn early_public_activation_requires_unverified_public_svid() {
+        assert!(should_enable_public_early("0", "PD_PPS", "0000"));
+        assert!(!should_enable_public_early("1", "PD_PPS", "0000"));
+        assert!(!should_enable_public_early("0", "PD", "0000"));
+        assert!(!should_enable_public_early("0", "PD_PPS", "2717"));
+        assert!(!should_enable_public_early("0", "PD_PPS", ""));
     }
 
     #[test]
@@ -657,6 +740,10 @@ mod tests {
         assert!(!should_capture_upstream_detach(AutoPhase::Settled, false));
         assert!(!should_capture_upstream_detach(
             AutoPhase::EnablingPublic(Instant::now()),
+            true
+        ));
+        assert!(!should_capture_upstream_detach(
+            AutoPhase::VerifyingPublic(Instant::now()),
             true
         ));
     }

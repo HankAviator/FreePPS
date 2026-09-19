@@ -17,6 +17,7 @@ pub const DISABLE_FILE: &str = "/data/adb/modules/FreePPS/disable";
 #[cfg(unix)]
 pub const MODULE_PROP: &str = "/data/adb/modules/FreePPS/module.prop";
 pub const PD_VERIFIED_PATH: &str = "/sys/class/qcom-battery/pd_verifed";
+pub const QCOM_ADAPTER_SVID_PATH: &str = "/sys/class/qcom-battery/adapter_svid";
 pub const PD_ADAPTER_VERIFIED_PATH: &str = "/sys/class/Charging_Adapter/pd_adapter/usbpd_verifed";
 pub const BATTERY_STATUS_PATH: &str = "/sys/class/power_supply/battery/status";
 pub const TYPEC_MODE_PATH: &str = "/sys/class/qcom-battery/typec_mode";

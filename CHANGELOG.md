@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.8.2 — 2026-09-19
+
+- Detect public PPS from the Qualcomm adapter SVID during the initial negotiation window.
+- Enable public PPS early enough for Xiaomi's high-power charge-pump path instead of its built-in 18 W fallback.
+- Reassert the public-PPS state once during Xiaomi's early negotiation reset window.
+- Keep Xiaomi-capable chargers on the native authentication path when they advertise a vendor SVID.
+
 ## v1.8.1 — 2026-09-18
 
 - Fix Qualcomm Auto mode falling back from an available public-PPS contract to fixed-voltage PD.
